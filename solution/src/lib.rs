@@ -134,3 +134,8 @@ pub mod register_client_public {
         pub target: u8,
     }
 }
+
+mod register_client;
+mod transfer;
+mod sectors_manager;
+mod atomic_register;
