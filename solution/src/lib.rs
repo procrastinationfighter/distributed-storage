@@ -96,7 +96,7 @@ pub mod transfer_public {
         hmac_system_key: &[u8; 64],
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), Error> {
-        transfer::deserialize_register_command(&mut data, hmac_system_key, hmac_client_key)
+        transfer::deserialize_register_command(data, hmac_system_key, hmac_client_key).await
     }
 
     pub async fn serialize_register_command(
@@ -104,7 +104,7 @@ pub mod transfer_public {
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         hmac_key: &[u8],
     ) -> Result<(), Error> {
-        transfer::serialize_register_command(cmd, &mut writer, hmac_key)
+        transfer::serialize_register_command(cmd, writer, hmac_key).await
     }
 }
 
