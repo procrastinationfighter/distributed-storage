@@ -87,7 +87,7 @@ pub mod sectors_manager_public {
 }
 
 pub mod transfer_public {
-    use crate::{RegisterCommand, transfer};
+    use crate::{transfer, RegisterCommand};
     use std::io::Error;
     use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -135,7 +135,7 @@ pub mod register_client_public {
     }
 }
 
-mod register_client;
-mod transfer;
-mod sectors_manager;
 mod atomic_register;
+mod register_client;
+mod sectors_manager;
+mod transfer;
