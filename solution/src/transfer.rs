@@ -3,17 +3,26 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use uuid::Uuid;
 
 use crate::domain::*;
 
 const WRITE_CONTENT_SIZE: usize = 4096;
 const HMAC_TAG_SIZE: usize = 256;
-const CLIENT_HEADER_SIZE: usize = 8;
+const HEADER_SIZE: usize = 8;
 const CLIENT_REQUEST_NO_SIZE: usize = 8;
-const CLIENT_SECTOR_ID_SIZE: usize = 8;
+const SECTOR_ID_SIZE: usize = 8;
 // Header, request number, sector id.
-const READ_MESSAGE_SIZE: usize = CLIENT_HEADER_SIZE + CLIENT_REQUEST_NO_SIZE + CLIENT_SECTOR_ID_SIZE;
+const READ_MESSAGE_SIZE: usize = HEADER_SIZE + CLIENT_REQUEST_NO_SIZE + SECTOR_ID_SIZE;
 const WRITE_MESSAGE_SIZE: usize = READ_MESSAGE_SIZE + WRITE_CONTENT_SIZE;
+
+const UUID_SIZE: usize = 16;
+const TIMESTAMP_SIZE: usize = 8;
+const WR_LINE_SIZE: usize = 8;
+const SECTOR_DATA_SIZE: usize = 4096;
+const SYSTEM_VAL_MESSAGE_SIZE: usize = TIMESTAMP_SIZE + WR_LINE_SIZE + SECTOR_DATA_SIZE;
+const SYSTEM_BASIC_MESSAGE_SIZE: usize = HEADER_SIZE + UUID_SIZE + SECTOR_ID_SIZE;
+const SYSTEM_MESSAGE_WITH_CONTENT_SIZE: usize = SYSTEM_BASIC_MESSAGE_SIZE + SYSTEM_VAL_MESSAGE_SIZE;
 
 // COPIED FROM LAB06
 // Create a type alias:
@@ -41,6 +50,15 @@ fn verify_hmac_tag(tag: &[u8], message: &str, secret_key: &[u8]) -> bool {
 
     // Verify the tag:
     mac.verify_slice(tag).is_ok()
+}
+
+async fn is_hmac_ok<I>(data: &mut (dyn AsyncRead + Send + Unpin), iter: I, key: &[u8]) -> Result<bool, io::Error> where I: IntoIterator<Item = u8> {
+        // TODO: might be slow
+        let mess = String::from_iter(iter.into_iter().map(|x| x as char));
+        let mut tag = [0;HMAC_TAG_SIZE];
+        data.read_exact(&mut tag).await?;
+
+    Ok(verify_hmac_tag(&tag, &mess, key))
 }
 
 #[repr(u8)]
@@ -109,7 +127,7 @@ pub async fn deserialize_register_command(
     let o = match message_type {
         MessageType::Write => parse_client_command(data, hmac_client_key, true, header_tail).await?,
         MessageType::Read => parse_client_command(data, hmac_client_key, false, header_tail).await?,
-        MessageType::ReadProc | MessageType::Value |MessageType::WriteProc | MessageType::Ack => parse_system_command(data, hmac_system_key, hmac_client_key).await?,
+        MessageType::ReadProc | MessageType::Value |MessageType::WriteProc | MessageType::Ack => parse_system_command(data, hmac_system_key, header_tail).await?,
     };
 
     todo!()
@@ -120,24 +138,20 @@ async fn parse_client_command(
     hmac_client_key: &[u8; 32],
     is_write: bool,
     header_tail: [u8; 4]) -> Result<(RegisterCommand, bool), io::Error> {
+        // Header is already read.
         let size = if is_write {WRITE_MESSAGE_SIZE} else {READ_MESSAGE_SIZE};
         let mut buf = vec![0;size];
         data.read_exact(&mut buf).await?;
 
         let request_identifier = u64::from_be_bytes(buf[0..CLIENT_REQUEST_NO_SIZE].try_into().unwrap());
-        let sector_idx = u64::from_be_bytes(buf[CLIENT_REQUEST_NO_SIZE..(CLIENT_REQUEST_NO_SIZE+CLIENT_SECTOR_ID_SIZE)].try_into().unwrap());
+        let sector_idx = u64::from_be_bytes(buf[CLIENT_REQUEST_NO_SIZE..(CLIENT_REQUEST_NO_SIZE+SECTOR_ID_SIZE)].try_into().unwrap());
         let content = if is_write {
-            ClientRegisterCommandContent::Write {data: SectorVec(buf[(CLIENT_REQUEST_NO_SIZE+CLIENT_SECTOR_ID_SIZE)..].to_vec())}
+            ClientRegisterCommandContent::Write {data: SectorVec(buf[(CLIENT_REQUEST_NO_SIZE+SECTOR_ID_SIZE)..].to_vec())}
         } else {
             ClientRegisterCommandContent::Read
         };
 
-        // TODO: might be slow
-        let mess = String::from_iter(MAGIC_NUMBER.into_iter().chain(header_tail.into_iter()).chain(buf.into_iter()).map(|x| x as char));
-        let mut tag = [0;HMAC_TAG_SIZE];
-        data.read_exact(&mut tag).await?;
-
-        let hmac_valid = verify_hmac_tag(&tag, &mess, hmac_client_key);
+        let iter = MAGIC_NUMBER.into_iter().chain(header_tail.into_iter()).chain(buf.into_iter());
 
         Ok((RegisterCommand::Client(
             ClientRegisterCommand {
@@ -148,15 +162,68 @@ async fn parse_client_command(
                 content,
             }
         ),
-        hmac_valid,)
+        is_hmac_ok(data, iter, hmac_client_key).await?,)
     )
 }
 
 async fn parse_system_command(
     data: &mut (dyn AsyncRead + Send + Unpin),
     hmac_system_key: &[u8; 64],
-    hmac_client_key: &[u8; 32],) -> Result<(RegisterCommand, bool), io::Error> {
-        todo!()
+    header_tail: [u8; 4],
+) -> Result<(RegisterCommand, bool), io::Error> {
+    // Header is already read.
+    // As for now, only requests are supported. 
+    // TODO: add responses
+    let with_message = is_system_command_with_message(header_tail[3]);
+    let size = if with_message {SYSTEM_MESSAGE_WITH_CONTENT_SIZE} else {SYSTEM_BASIC_MESSAGE_SIZE};
+    let mut buf = vec![0;size];
+    data.read_exact(&mut buf).await?;
+    
+    let uuid = Uuid::from_u128(u128::from_be_bytes(buf[0..UUID_SIZE].try_into().unwrap()));
+    let sector_idx = u64::from_be_bytes(buf[UUID_SIZE..(UUID_SIZE+SECTOR_ID_SIZE)].try_into().unwrap());
+    let content = match MessageType::try_from(header_tail[3]).unwrap() {
+        MessageType::ReadProc => {
+            SystemRegisterCommandContent::ReadProc
+        },
+        MessageType::Value => {
+            let timestamp = u64::from_be_bytes(buf[(UUID_SIZE+SECTOR_ID_SIZE)..(UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE)].try_into().unwrap());
+            let write_rank = buf[(UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE+WR_LINE_SIZE - 1)];
+            let sector_data = buf[UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE+WR_LINE_SIZE..].to_vec();
+            SystemRegisterCommandContent::Value { timestamp, write_rank, sector_data: SectorVec(sector_data) }
+        },
+        MessageType::WriteProc => {
+            let timestamp = u64::from_be_bytes(buf[(UUID_SIZE+SECTOR_ID_SIZE)..(UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE)].try_into().unwrap());
+            let write_rank = buf[(UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE+WR_LINE_SIZE - 1)];
+            let sector_data = buf[UUID_SIZE+SECTOR_ID_SIZE+TIMESTAMP_SIZE+WR_LINE_SIZE..].to_vec();
+            SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write: SectorVec(sector_data) }
+        },
+        MessageType::Ack => {
+            SystemRegisterCommandContent::Ack
+        },
+        _ => return Err(unexpected_error_as_io("unexpected message type in system command")),
+    };
+
+    let iter = MAGIC_NUMBER.into_iter().chain(header_tail.into_iter()).chain(buf.into_iter());
+
+    Ok((RegisterCommand::System(
+        SystemRegisterCommand {
+            header: SystemCommandHeader {
+                process_identifier: header_tail[2],
+                msg_ident: uuid,
+                sector_idx,
+            },
+            content,
+        }
+    ),
+    is_hmac_ok(data, iter, hmac_system_key).await?,)
+)
+}
+
+fn is_system_command_with_message(code: u8) -> bool {
+    match MessageType::try_from(code).unwrap() {
+         MessageType::Value | MessageType::WriteProc => true,
+         _ => false,
+    }
 }
 
 pub async fn serialize_register_command(
