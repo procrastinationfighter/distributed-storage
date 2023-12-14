@@ -1,8 +1,47 @@
 use crate::{RegisterCommand, transfer};
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use crate::domain::*;
+
+const WRITE_CONTENT_SIZE: usize = 4096;
+const HMAC_TAG_SIZE: usize = 256;
+const CLIENT_HEADER_SIZE: usize = 8;
+const CLIENT_REQUEST_NO_SIZE: usize = 8;
+const CLIENT_SECTOR_ID_SIZE: usize = 8;
+// Header, request number, sector id.
+const READ_MESSAGE_SIZE: usize = CLIENT_HEADER_SIZE + CLIENT_REQUEST_NO_SIZE + CLIENT_SECTOR_ID_SIZE;
+const WRITE_MESSAGE_SIZE: usize = READ_MESSAGE_SIZE + WRITE_CONTENT_SIZE;
+
+// COPIED FROM LAB06
+// Create a type alias:
+type HmacSha256 = Hmac<Sha256>;
+
+fn calculate_hmac_tag(message: &str, secret_key: &[u8]) -> [u8; 32] {
+    // Initialize a new MAC instance from the secret key:
+    let mut mac = HmacSha256::new_from_slice(secret_key).unwrap();
+
+    // Calculate MAC for the data (one can provide it in multiple portions):
+    mac.update(message.as_bytes());
+
+    // Finalize the computations of MAC and obtain the resulting tag:
+    let tag = mac.finalize().into_bytes();
+
+    tag.into()
+}
+
+fn verify_hmac_tag(tag: &[u8], message: &str, secret_key: &[u8]) -> bool {
+    // Initialize a new MAC instance from the secret key:
+    let mut mac = HmacSha256::new_from_slice(secret_key).unwrap();
+
+    // Calculate MAC for the data (one can provide it in multiple portions):
+    mac.update(message.as_bytes());
+
+    // Verify the tag:
+    mac.verify_slice(tag).is_ok()
+}
 
 #[repr(u8)]
 enum MessageType {
@@ -67,14 +106,57 @@ pub async fn deserialize_register_command(
         Err(e) => return Err(unexpected_error_as_io("wrong message type"))
     };
 
-    match message_type {
-        MessageType::Write => todo!(),
-        MessageType::Read => todo!(),
-        MessageType::ReadProc => todo!(),
-        MessageType::Value => todo!(),
-        MessageType::WriteProc => todo!(),
-        MessageType::Ack => todo!(),
-    }
+    let o = match message_type {
+        MessageType::Write => parse_client_command(data, hmac_client_key, true, header_tail).await?,
+        MessageType::Read => parse_client_command(data, hmac_client_key, false, header_tail).await?,
+        MessageType::ReadProc | MessageType::Value |MessageType::WriteProc | MessageType::Ack => parse_system_command(data, hmac_system_key, hmac_client_key).await?,
+    };
+
+    todo!()
+}
+
+async fn parse_client_command(
+    data: &mut (dyn AsyncRead + Send + Unpin),
+    hmac_client_key: &[u8; 32],
+    is_write: bool,
+    header_tail: [u8; 4]) -> Result<(RegisterCommand, bool), io::Error> {
+        let size = if is_write {WRITE_MESSAGE_SIZE} else {READ_MESSAGE_SIZE};
+        let mut buf = vec![0;size];
+        data.read_exact(&mut buf).await?;
+
+        let request_identifier = u64::from_be_bytes(buf[0..CLIENT_REQUEST_NO_SIZE].try_into().unwrap());
+        let sector_idx = u64::from_be_bytes(buf[CLIENT_REQUEST_NO_SIZE..(CLIENT_REQUEST_NO_SIZE+CLIENT_SECTOR_ID_SIZE)].try_into().unwrap());
+        let content = if is_write {
+            ClientRegisterCommandContent::Write {data: SectorVec(buf[(CLIENT_REQUEST_NO_SIZE+CLIENT_SECTOR_ID_SIZE)..].to_vec())}
+        } else {
+            ClientRegisterCommandContent::Read
+        };
+
+        // TODO: might be slow
+        let mess = String::from_iter(MAGIC_NUMBER.into_iter().chain(header_tail.into_iter()).chain(buf.into_iter()).map(|x| x as char));
+        let mut tag = [0;HMAC_TAG_SIZE];
+        data.read_exact(&mut tag).await?;
+
+        let hmac_valid = verify_hmac_tag(&tag, &mess, hmac_client_key);
+
+        Ok((RegisterCommand::Client(
+            ClientRegisterCommand {
+                header: ClientCommandHeader {
+                    request_identifier,
+                    sector_idx,
+                },
+                content,
+            }
+        ),
+        hmac_valid,)
+    )
+}
+
+async fn parse_system_command(
+    data: &mut (dyn AsyncRead + Send + Unpin),
+    hmac_system_key: &[u8; 64],
+    hmac_client_key: &[u8; 32],) -> Result<(RegisterCommand, bool), io::Error> {
+        todo!()
 }
 
 pub async fn serialize_register_command(
