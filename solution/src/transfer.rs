@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::domain::*;
 
 const WRITE_CONTENT_SIZE: usize = 4096;
-const HMAC_TAG_SIZE: usize = 256;
+const HMAC_TAG_SIZE: usize = 32;
 const HEADER_SIZE: usize = 8;
 const CLIENT_REQUEST_NO_SIZE: usize = 8;
 const SECTOR_ID_SIZE: usize = 8;
@@ -65,9 +65,10 @@ async fn is_hmac_ok(
 }
 
 #[repr(u8)]
+#[derive(Debug)]
 enum MessageType {
-    Write = 0x01,
-    Read = 0x02,
+    Read = 0x01,
+    Write = 0x02,
     ReadProc = 0x03,
     Value = 0x04,
     WriteProc = 0x05,
@@ -95,19 +96,22 @@ impl TryFrom<u8> for MessageType {
 async fn read_next_datagram_header(
     data: &mut (dyn AsyncRead + Send + Unpin),
 ) -> Result<[u8; 4], io::Error> {
-    let mut i = 0;
+    let mut curr_num = [0; MAGIC_NUMBER_LEN];
     let mut buf = [0; 1];
 
-    while i < MAGIC_NUMBER.len() {
-        let _ = data.read_exact(&mut buf).await?;
-        if buf[0] == MAGIC_NUMBER[i] {
-            i += 1;
-        } else {
-            i = 0;
+    let _ = data.read_exact(&mut curr_num).await?;
+
+    loop {
+        if curr_num == MAGIC_NUMBER {
+            break;
         }
+
+        let _ = data.read_exact(&mut buf).await?;
+        curr_num.rotate_right(MAGIC_NUMBER_LEN - 1);
+        curr_num[MAGIC_NUMBER_LEN - 1] = buf[0];
     }
 
-    let mut buf = [0; 4];
+    let mut buf = [0; HEADER_SIZE - MAGIC_NUMBER_LEN];
     let _ = data.read_exact(&mut buf).await?;
 
     Ok(buf)
@@ -162,7 +166,7 @@ async fn parse_client_command(
         CLIENT_WRITE_MESSAGE_SIZE
     } else {
         CLIENT_READ_MESSAGE_SIZE
-    };
+    } - HEADER_SIZE;
     let mut buf = vec![0; size];
     data.read_exact(&mut buf).await?;
 
@@ -212,9 +216,10 @@ async fn parse_system_command(
         SYSTEM_MESSAGE_WITH_CONTENT_SIZE
     } else {
         SYSTEM_BASIC_MESSAGE_SIZE
-    };
+    } - HEADER_SIZE;
+
     let mut buf = vec![0; size];
-    data.read_exact(&mut buf).await?;
+    let _ = data.read_exact(&mut buf).await?;
 
     let uuid = Uuid::from_u128(u128::from_be_bytes(buf[0..UUID_SIZE].try_into().unwrap()));
     let sector_idx = u64::from_be_bytes(
@@ -222,6 +227,7 @@ async fn parse_system_command(
             .try_into()
             .unwrap(),
     );
+
     let content = match MessageType::try_from(header_tail[3]).unwrap() {
         MessageType::ReadProc => SystemRegisterCommandContent::ReadProc,
         MessageType::Value => {

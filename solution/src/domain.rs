@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub static MAGIC_NUMBER: [u8; 4] = [0x61, 0x74, 0x64, 0x64];
+pub const MAGIC_NUMBER_LEN: usize = 4;
 
 pub struct Configuration {
     /// Hmac key to verify and sign internal requests.
