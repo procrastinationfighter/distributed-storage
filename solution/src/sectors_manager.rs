@@ -22,6 +22,10 @@ pub struct Manager {
 impl Manager {
     pub async fn new_arc(path: PathBuf) -> Arc<dyn SectorsManager> {
         log::debug!("new manager in creation for dir {:?}", path);
+
+        // Create the directory if not exists.
+        create_dir_all(path.clone()).await.unwrap();
+
         let manager = Arc::new(Manager {
             metadata: RwLock::new(HashMap::new()),
             path: path.clone(),
