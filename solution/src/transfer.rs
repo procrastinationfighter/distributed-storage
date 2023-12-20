@@ -64,6 +64,12 @@ async fn is_hmac_ok(
     Ok(verify_hmac_tag(&tag, message, key))
 }
 
+async fn read_remaining_bytes(data: &mut (dyn AsyncRead + Send + Unpin), len: usize) {
+    let mut buf = vec![0;len];
+    // Don't check for errors, as this is used in case of error anyway.
+    let _ = data.read_exact(&mut buf).await;
+}
+
 #[repr(u8)]
 #[derive(Debug)]
 enum MessageType {
@@ -80,8 +86,8 @@ impl TryFrom<u8> for MessageType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x01 => Ok(Self::Write),
-            0x02 => Ok(Self::Read),
+            0x01 => Ok(Self::Read),
+            0x02 => Ok(Self::Write),
             0x03 => Ok(Self::ReadProc),
             0x04 => Ok(Self::Value),
             0x05 => Ok(Self::WriteProc),
@@ -133,6 +139,7 @@ pub async fn deserialize_register_command(
     let message_type = match MessageType::try_from(*message_type) {
         Ok(m) => m,
         Err(e) => {
+            log::warn!("Received message of unknown type: {}", e);
             return Err(unexpected_error_as_io(&format!(
                 "wrong message type: {}",
                 e
@@ -142,9 +149,11 @@ pub async fn deserialize_register_command(
 
     let o = match message_type {
         MessageType::Write => {
+            log::debug!("parsing client message of type write");
             parse_client_command(data, hmac_client_key, true, header_tail).await?
         }
         MessageType::Read => {
+            log::debug!("parsing client message of type read");
             parse_client_command(data, hmac_client_key, false, header_tail).await?
         }
         MessageType::ReadProc | MessageType::Value | MessageType::WriteProc | MessageType::Ack => {
@@ -167,6 +176,7 @@ async fn parse_client_command(
     } else {
         CLIENT_READ_MESSAGE_SIZE
     } - HEADER_SIZE;
+
     let mut buf = vec![0; size];
     data.read_exact(&mut buf).await?;
 
@@ -262,11 +272,13 @@ async fn parse_system_command(
         }
         MessageType::Ack => SystemRegisterCommandContent::Ack,
         _ => {
+            read_remaining_bytes(data, HMAC_TAG_SIZE).await;
             return Err(unexpected_error_as_io(
                 "unexpected message type in system command",
             ))
         }
     };
+    log::debug!("parsed system message with content: {:?}", content);
 
     let iter: Vec<u8> = MAGIC_NUMBER
         .into_iter()

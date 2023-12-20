@@ -88,7 +88,7 @@ pub mod sectors_manager_public {
 
 pub mod transfer_public {
     use crate::{transfer, RegisterCommand};
-    use std::io::Error;
+    use std::io::{Error, ErrorKind};
     use tokio::io::{AsyncRead, AsyncWrite};
 
     pub async fn deserialize_register_command(
@@ -96,7 +96,16 @@ pub mod transfer_public {
         hmac_system_key: &[u8; 64],
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), Error> {
-        transfer::deserialize_register_command(data, hmac_system_key, hmac_client_key).await
+        loop {
+            let x = transfer::deserialize_register_command(data, hmac_system_key, hmac_client_key).await;
+            if let Err(e) = x {
+                if e.kind() != ErrorKind::Other {
+                    return Err(e);
+                }
+            } else {
+                return x;
+            }
+        }
     }
 
     pub async fn serialize_register_command(
