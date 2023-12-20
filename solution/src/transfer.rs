@@ -198,7 +198,6 @@ async fn parse_client_command(
         .into_iter()
         .chain(header_tail.into_iter())
         .chain(buf.into_iter())
-        .map(|x| x)
         .collect();
 
     Ok((
@@ -284,7 +283,6 @@ async fn parse_system_command(
         .into_iter()
         .chain(header_tail.into_iter())
         .chain(buf.into_iter())
-        .map(|x| x)
         .collect();
 
     Ok((
@@ -301,10 +299,7 @@ async fn parse_system_command(
 }
 
 fn is_system_command_with_message(code: u8) -> bool {
-    match MessageType::try_from(code).unwrap() {
-        MessageType::Value | MessageType::WriteProc => true,
-        _ => false,
-    }
+    matches!(MessageType::try_from(code).unwrap(), MessageType::Value | MessageType::WriteProc)
 }
 
 pub async fn serialize_register_command(

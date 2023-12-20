@@ -1,5 +1,6 @@
 use crate::domain::*;
 use crate::sectors_manager_public::*;
+use core::panic;
 use core::str;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -10,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 const TEMP_PATH_SUFFIX: &str = "tmp";
+const CORRECT_FILE_SIZE: u64 = 4096;
 
 pub struct Manager {
     // TODO: LRU cache for file descriptors
@@ -33,6 +35,12 @@ impl Manager {
             log::debug!("handling file {:?}", file.file_name());
 
             if let Ok(file_name) = file.file_name().into_string() {
+                // If .tmp file, make sure that file size is correct.
+                // This protects us in case writing to file failed, but file exists.
+                if file_name.ends_with(TEMP_PATH_SUFFIX) && file.metadata().await.unwrap().len() != CORRECT_FILE_SIZE {
+                    continue;
+                }
+
                 // Algorithm for writing:
                 // 1. Write to .tmp file
                 // 2. Remove old file
@@ -203,8 +211,17 @@ impl SectorsManager for Manager {
         file.sync_data().await.unwrap();
 
         // Remove old file.
-        remove_file(&old_filename).await.unwrap();
-        sync_dir(self.path.clone()).await;
+        match remove_file(&old_filename).await {
+            // If file didn't exist, ignore the error.
+            // Else panic.
+            Ok(_) => sync_dir(self.path.clone()).await,
+            Err(e) => {
+                match e.kind() {
+                    ErrorKind::NotFound => (),
+                    _ => panic!("removing old file failed"),
+                }
+            }
+        }
 
         // Rename new file from .tmp to normal name.
         rename(
