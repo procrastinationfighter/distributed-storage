@@ -17,6 +17,7 @@ pub struct Manager {
     // TODO: LRU cache for file descriptors
     metadata: RwLock<HashMap<SectorIdx, (u64, u8)>>,
     path: PathBuf,
+    dir_fd: File,
 }
 
 impl Manager {
@@ -29,6 +30,7 @@ impl Manager {
         let manager = Arc::new(Manager {
             metadata: RwLock::new(HashMap::new()),
             path: path.clone(),
+            dir_fd: File::open(path.clone()).await.unwrap(),
         });
         let mut metadata = manager.metadata.write().await;
 
@@ -132,17 +134,8 @@ impl Manager {
     }
 
     async fn sync_dir(&self) {
-        File::open(self.path.clone())
-            .await
-            .unwrap()
-            .sync_all()
-            .await
-            .unwrap();
+        self.dir_fd.sync_all().await.unwrap();
     }
-}
-
-async fn sync_dir(path: PathBuf) {
-    File::open(path).await.unwrap().sync_all().await.unwrap();
 }
 
 #[async_trait::async_trait]
@@ -218,7 +211,7 @@ impl SectorsManager for Manager {
         match remove_file(&old_filename).await {
             // If file didn't exist, ignore the error.
             // Else panic.
-            Ok(_) => sync_dir(self.path.clone()).await,
+            Ok(_) => self.sync_dir().await,
             Err(e) => {
                 match e.kind() {
                     ErrorKind::NotFound => (),
@@ -234,7 +227,7 @@ impl SectorsManager for Manager {
         )
         .await
         .unwrap();
-        sync_dir(self.path.clone()).await;
+        self.sync_dir().await;
 
         self.metadata
             .write()
