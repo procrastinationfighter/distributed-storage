@@ -62,6 +62,7 @@ pub mod atomic_register_public {
 }
 
 pub mod sectors_manager_public {
+    use crate::sectors_manager::*;
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -82,7 +83,7 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        unimplemented!()
+        Manager::new_arc(path).await
     }
 }
 
@@ -97,7 +98,8 @@ pub mod transfer_public {
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), Error> {
         loop {
-            let x = transfer::deserialize_register_command(data, hmac_system_key, hmac_client_key).await;
+            let x = transfer::deserialize_register_command(data, hmac_system_key, hmac_client_key)
+                .await;
             if let Err(e) = x {
                 if e.kind() != ErrorKind::Other {
                     return Err(e);

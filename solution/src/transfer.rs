@@ -65,7 +65,7 @@ async fn is_hmac_ok(
 }
 
 async fn read_remaining_bytes(data: &mut (dyn AsyncRead + Send + Unpin), len: usize) {
-    let mut buf = vec![0;len];
+    let mut buf = vec![0; len];
     // Don't check for errors, as this is used in case of error anyway.
     let _ = data.read_exact(&mut buf).await;
 }
@@ -143,7 +143,7 @@ pub async fn deserialize_register_command(
             return Err(unexpected_error_as_io(&format!(
                 "wrong message type: {}",
                 e
-            )))
+            )));
         }
     };
 
@@ -275,7 +275,7 @@ async fn parse_system_command(
             read_remaining_bytes(data, HMAC_TAG_SIZE).await;
             return Err(unexpected_error_as_io(
                 "unexpected message type in system command",
-            ))
+            ));
         }
     };
     log::debug!("parsed system message with content: {:?}", content);

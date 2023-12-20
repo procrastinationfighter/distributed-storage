@@ -4,6 +4,9 @@ use uuid::Uuid;
 
 pub static MAGIC_NUMBER: [u8; 4] = [0x61, 0x74, 0x64, 0x64];
 pub const MAGIC_NUMBER_LEN: usize = 4;
+pub const FILE_DESCRIPTOR_LIMIT: usize = 1024;
+pub const CLIENT_CONNECTION_LIMIT: usize = 16;
+pub const SECTOR_SIZE: usize = 4096;
 
 pub struct Configuration {
     /// Hmac key to verify and sign internal requests.
