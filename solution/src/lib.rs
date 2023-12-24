@@ -11,12 +11,11 @@ pub async fn run_register_process(config: Configuration) {
 }
 
 pub mod atomic_register_public {
+    use crate::atomic_register::*;
     use crate::{
-        ClientRegisterCommand, OperationSuccess, RegisterClient, SectorIdx, SectorsManager,
+        ClientCallback, ClientRegisterCommand, RegisterClient, SectorIdx, SectorsManager,
         SystemRegisterCommand,
     };
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::Arc;
 
     #[async_trait::async_trait]
@@ -30,11 +29,7 @@ pub mod atomic_register_public {
         async fn client_command(
             &mut self,
             cmd: ClientRegisterCommand,
-            success_callback: Box<
-                dyn FnOnce(OperationSuccess) -> Pin<Box<dyn Future<Output = ()> + Send>>
-                    + Send
-                    + Sync,
-            >,
+            success_callback: ClientCallback,
         );
 
         /// Handle a system command.
@@ -57,7 +52,16 @@ pub mod atomic_register_public {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
     ) -> Box<dyn AtomicRegister> {
-        unimplemented!()
+        Box::new(
+            Register::new(
+                self_ident,
+                sector_idx,
+                register_client,
+                sectors_manager,
+                processes_count,
+            )
+            .await,
+        )
     }
 }
 

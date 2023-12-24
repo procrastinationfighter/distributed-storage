@@ -1,5 +1,4 @@
-use core::time;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,8 +8,7 @@ use uuid::Uuid;
 use crate::domain::*;
 use crate::OperationSuccess;
 use crate::{
-    atomic_register_public, AtomicRegister, RegisterClient, SectorIdx, SectorVec, SectorsManager,
-    SystemRegisterCommand,
+    AtomicRegister, RegisterClient, SectorIdx, SectorVec, SectorsManager, SystemRegisterCommand,
 };
 
 pub struct Register {
@@ -28,8 +26,7 @@ pub struct Register {
     read_val: SectorVec,
     read_list: HashMap<u8, (u64, u8, SectorVec)>,
     ack_list: HashSet<u8>,
-    success_callback:
-        Box<dyn FnOnce(OperationSuccess) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+    success_callback: ClientCallback,
 
     client: Arc<dyn RegisterClient>,
     manager: Arc<dyn SectorsManager>,
@@ -42,7 +39,7 @@ fn dummy_callback(_: OperationSuccess) -> Pin<Box<dyn Future<Output = ()> + Send
 }
 
 impl Register {
-    async fn new(
+    pub async fn new(
         self_ident: u8,
         sector_idx: SectorIdx,
         register_client: Arc<dyn RegisterClient>,
@@ -276,25 +273,25 @@ impl AtomicRegister for Register {
         self.ack_list = HashSet::new();
         self.success_callback = success_callback;
 
-        let mut message = SystemRegisterCommand {
-            header: SystemCommandHeader {
-                process_identifier: self.self_ident,
-                msg_ident: self.op_id,
-                sector_idx: self.sector_idx,
-            },
-            content: SystemRegisterCommandContent::ReadProc,
-        };
-
         match cmd.content {
             ClientRegisterCommandContent::Read => {
                 self.reading = true;
             }
             ClientRegisterCommandContent::Write { data } => {
                 self.writing = true;
+                self.write_val = data;
             }
         };
 
-        self.broadcast(message).await;
+        self.broadcast(SystemRegisterCommand {
+            header: SystemCommandHeader {
+                process_identifier: self.self_ident,
+                msg_ident: self.op_id,
+                sector_idx: self.sector_idx,
+            },
+            content: SystemRegisterCommandContent::ReadProc,
+        })
+        .await;
     }
 
     async fn system_command(&mut self, cmd: SystemRegisterCommand) {
