@@ -46,6 +46,7 @@ impl Register {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
     ) -> Register {
+        log::debug!("creating a new register, self ident: {}, sector_idx: {}", self_ident, sector_idx);
         let (timestamp, write_rank) = sectors_manager.read_metadata(sector_idx).await;
         let val = sectors_manager.read_data(sector_idx).await;
 
@@ -74,6 +75,7 @@ impl Register {
     }
 
     async fn send(&self, cmd: SystemRegisterCommand, target: u8) {
+        log::debug!("{} sends {:?} to {}", self.self_ident, cmd, target);
         self.client
             .send(crate::Send {
                 cmd: Arc::new(cmd),
@@ -83,12 +85,14 @@ impl Register {
     }
 
     async fn broadcast(&self, cmd: SystemRegisterCommand) {
+        log::debug!("{} broadcasts {:?}", self.self_ident, cmd);
         self.client
             .broadcast(crate::Broadcast { cmd: Arc::new(cmd) })
             .await
     }
 
     async fn store(&mut self, sector: (SectorVec, u64, u8)) {
+        log::debug!("{} stores {:?}", self.self_ident, sector);
         self.manager.write(self.sector_idx, &sector).await;
 
         self.timestamp = sector.1;
@@ -130,6 +134,8 @@ impl Register {
         if self.read_list.len() > (self.processes_count / 2).into()
             && (self.reading || self.writing)
         {
+            log::debug!("{} enters write phase for operation {}, sector: {}", self.self_ident, self.op_id, self.sector_idx);
+
             let mut v = SectorVec(vec![]);
             std::mem::swap(&mut v, &mut self.val);
 
@@ -198,6 +204,7 @@ impl Register {
         data: SectorVec,
     ) {
         if (timestamp, write_rank) > (self.timestamp, self.write_rank) {
+            log::debug!("{} stores new data in write_proc, sector: {}", self.self_ident, self.sector_idx);
             self.store((data, timestamp, write_rank)).await;
         }
 
@@ -229,25 +236,29 @@ impl Register {
 
         if self.ack_list.len() > (self.processes_count / 2).into() && (self.reading || self.writing)
         {
+            log::debug!("{} enters finishes the transaction and runs callback, sector: {}", self.self_ident, self.sector_idx);
+
             self.ack_list = HashSet::new();
             self.write_phase = false;
 
             let callback = std::mem::replace(&mut self.success_callback, Box::new(dummy_callback));
 
             if self.reading {
+                log::debug!("{} finishes a read, sector: {}", self.self_ident, self.sector_idx);
                 let mut v = SectorVec(vec![]);
                 std::mem::swap(&mut v, &mut self.read_val);
                 self.reading = false;
                 callback(OperationSuccess {
                     request_identifier: self.client_op_id,
                     op_return: OperationReturn::Read(ReadReturn { read_data: v }),
-                });
+                }).await;
             } else {
+                log::debug!("{} finishes a write, sector: {}", self.self_ident, self.sector_idx);
                 self.writing = false;
                 callback(OperationSuccess {
                     request_identifier: self.client_op_id,
                     op_return: OperationReturn::Write,
-                });
+                }).await;
             }
         }
     }
@@ -266,6 +277,7 @@ impl AtomicRegister for Register {
             log::warn!("atomic register for sector {}, write rank {} received client request for sector {}", self.sector_idx, self.write_rank, cmd.header.sector_idx);
             return;
         }
+        log::debug!("{} received a client command: {:?}", self.self_ident, cmd);
 
         self.op_id = Uuid::new_v4();
         self.client_op_id = cmd.header.request_identifier;
@@ -299,6 +311,8 @@ impl AtomicRegister for Register {
             log::warn!("atomic register for sector {}, write rank {} received server request for sector {}", self.sector_idx, self.write_rank, cmd.header.sector_idx);
             return;
         }
+
+        log::debug!("{} received a system command: {:?}", self.self_ident, cmd);
 
         match cmd.content {
             SystemRegisterCommandContent::ReadProc => self.read_proc(cmd.header).await,

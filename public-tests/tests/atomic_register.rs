@@ -44,9 +44,11 @@ async fn read_triggers_broadcast() {
     assert!(matches!(rx.recv().await, Ok(ClientMsg::Broadcast(_))));
 }
 
+use simple_logger;
 #[tokio::test]
 #[timeout(2000)]
 async fn majority_completes_operations_after_crash() {
+    simple_logger::init_with_level(log::Level::Debug).unwrap();
     // given
     let (tx_client, rx_client) = unbounded();
     let (tx_op_c, rx_op_c) = unbounded();
@@ -78,7 +80,11 @@ async fn majority_completes_operations_after_crash() {
     propagate_all_messages(&mut registers, &rx_client).await;
 
     // then
-    assert_eq!(rx_op_c.recv().await, Ok(()));
+    let a = rx_op_c.recv().await;
+    if a.is_err() {
+        println!("{:?}", a.err().unwrap().to_string());
+    }
+    assert_eq!(a, Ok(()));
     assert_eq!(drive.read_data(2).await, SectorVec(vec![200; 4096]));
 }
 
