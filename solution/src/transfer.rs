@@ -299,7 +299,10 @@ async fn parse_system_command(
 }
 
 fn is_system_command_with_message(code: u8) -> bool {
-    matches!(MessageType::try_from(code).unwrap(), MessageType::Value | MessageType::WriteProc)
+    matches!(
+        MessageType::try_from(code).unwrap(),
+        MessageType::Value | MessageType::WriteProc
+    )
 }
 
 pub async fn serialize_register_command(
@@ -314,7 +317,7 @@ pub async fn serialize_register_command(
 
     let mut written = 0;
     while written < buf.len() {
-        written += writer.write(&buf[written..]).await?;
+        written += writer.write(&buf[written..]).await.unwrap();
     }
     Ok(())
 }

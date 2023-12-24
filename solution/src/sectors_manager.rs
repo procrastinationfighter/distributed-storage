@@ -43,7 +43,9 @@ impl Manager {
             if let Ok(file_name) = file.file_name().into_string() {
                 // If .tmp file, make sure that file size is correct.
                 // This protects us in case writing to file failed, but file exists.
-                if file_name.ends_with(TEMP_PATH_SUFFIX) && file.metadata().await.unwrap().len() != CORRECT_FILE_SIZE {
+                if file_name.ends_with(TEMP_PATH_SUFFIX)
+                    && file.metadata().await.unwrap().len() != CORRECT_FILE_SIZE
+                {
                     continue;
                 }
 
@@ -212,12 +214,10 @@ impl SectorsManager for Manager {
             // If file didn't exist, ignore the error.
             // Else panic.
             Ok(_) => self.sync_dir().await,
-            Err(e) => {
-                match e.kind() {
-                    ErrorKind::NotFound => (),
-                    _ => panic!("removing old file failed"),
-                }
-            }
+            Err(e) => match e.kind() {
+                ErrorKind::NotFound => (),
+                _ => panic!("removing old file failed"),
+            },
         }
 
         // Rename new file from .tmp to normal name.
