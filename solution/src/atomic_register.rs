@@ -46,7 +46,11 @@ impl Register {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
     ) -> Register {
-        log::debug!("creating a new register, self ident: {}, sector_idx: {}", self_ident, sector_idx);
+        log::debug!(
+            "creating a new register, self ident: {}, sector_idx: {}",
+            self_ident,
+            sector_idx
+        );
         let (timestamp, write_rank) = sectors_manager.read_metadata(sector_idx).await;
         let val = sectors_manager.read_data(sector_idx).await;
 
@@ -134,7 +138,12 @@ impl Register {
         if self.read_list.len() > (self.processes_count / 2).into()
             && (self.reading || self.writing)
         {
-            log::debug!("{} enters write phase for operation {}, sector: {}", self.self_ident, self.op_id, self.sector_idx);
+            log::debug!(
+                "{} enters write phase for operation {}, sector: {}",
+                self.self_ident,
+                self.op_id,
+                self.sector_idx
+            );
 
             let mut v = SectorVec(vec![]);
             std::mem::swap(&mut v, &mut self.val);
@@ -204,7 +213,11 @@ impl Register {
         data: SectorVec,
     ) {
         if (timestamp, write_rank) > (self.timestamp, self.write_rank) {
-            log::debug!("{} stores new data in write_proc, sector: {}", self.self_ident, self.sector_idx);
+            log::debug!(
+                "{} stores new data in write_proc, sector: {}",
+                self.self_ident,
+                self.sector_idx
+            );
             self.store((data, timestamp, write_rank)).await;
         }
 
@@ -236,7 +249,11 @@ impl Register {
 
         if self.ack_list.len() > (self.processes_count / 2).into() && (self.reading || self.writing)
         {
-            log::debug!("{} enters finishes the transaction and runs callback, sector: {}", self.self_ident, self.sector_idx);
+            log::debug!(
+                "{} enters finishes the transaction and runs callback, sector: {}",
+                self.self_ident,
+                self.sector_idx
+            );
 
             self.ack_list = HashSet::new();
             self.write_phase = false;
@@ -244,21 +261,31 @@ impl Register {
             let callback = std::mem::replace(&mut self.success_callback, Box::new(dummy_callback));
 
             if self.reading {
-                log::debug!("{} finishes a read, sector: {}", self.self_ident, self.sector_idx);
+                log::debug!(
+                    "{} finishes a read, sector: {}",
+                    self.self_ident,
+                    self.sector_idx
+                );
                 let mut v = SectorVec(vec![]);
                 std::mem::swap(&mut v, &mut self.read_val);
                 self.reading = false;
                 callback(OperationSuccess {
                     request_identifier: self.client_op_id,
                     op_return: OperationReturn::Read(ReadReturn { read_data: v }),
-                }).await;
+                })
+                .await;
             } else {
-                log::debug!("{} finishes a write, sector: {}", self.self_ident, self.sector_idx);
+                log::debug!(
+                    "{} finishes a write, sector: {}",
+                    self.self_ident,
+                    self.sector_idx
+                );
                 self.writing = false;
                 callback(OperationSuccess {
                     request_identifier: self.client_op_id,
                     op_return: OperationReturn::Write,
-                }).await;
+                })
+                .await;
             }
         }
     }

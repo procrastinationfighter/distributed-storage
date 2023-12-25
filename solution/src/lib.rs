@@ -151,6 +151,6 @@ pub mod register_client_public {
 }
 
 mod atomic_register;
-mod register_client;
 mod sectors_manager;
+mod system;
 mod transfer;
