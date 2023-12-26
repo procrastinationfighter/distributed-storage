@@ -276,7 +276,7 @@ async fn parse_system_command(
             ));
         }
     };
-    log::debug!("parsed system message with content: {:?}", content);
+    // log::debug!("parsed system message with content: {:?}", content);
 
     let iter: Vec<u8> = MAGIC_NUMBER
         .into_iter()

@@ -1,7 +1,7 @@
 use crate::transfer::calculate_hmac_tag;
 use crate::{
     build_atomic_register, build_sectors_manager, deserialize_register_command, domain::*,
-    register_client_public::*, serialize_register_command, SectorsManager,
+    register_client_public::*, serialize_register_command, AtomicRegister, SectorsManager,
 };
 use std::collections::HashMap;
 use std::io;
@@ -59,12 +59,14 @@ async fn sending_loop(
                 };
             }
             _ = retry_conn_timer.tick(), if stream.is_none() => {
+                log::debug!("trying to regain connection to {:?}", addr.clone());
                 stream = try_gaining_connection_with_peer(addr.clone()).await;
             }
             m = receiver.recv(), if stream.is_some() => {
                 match m {
                     Some(mess) => match mess {
                         SendType::Broadcast(b) => {
+                            log::debug!("got broadcast order: {:?}", b.cmd);
                             let cmd = RegisterCommand::System((*b.cmd).clone());
                             broadcast_messages.insert(b.cmd.header.sector_idx, cmd);
                         },
@@ -89,7 +91,11 @@ async fn sending_loop(
 }
 
 async fn try_gaining_connection_with_peer(addr: (String, u16)) -> Option<TcpStream> {
-    TcpStream::connect(addr).await.ok()
+    let res = TcpStream::connect(addr.clone()).await;
+    if res.is_err() {
+        log::debug!("failed when connecting to {:?}", addr);
+    }
+    res.ok()
 }
 
 async fn self_sending_loop(
@@ -141,11 +147,17 @@ impl Client {
         config: Configuration,
         self_channel: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
     ) -> Client {
+        log::debug!("Creating a new client with config: {:?}", config.public);
+
         let mut broadcast_senders = HashMap::with_capacity(config.public.tcp_locations.len());
         let mut handles = Vec::with_capacity(config.public.tcp_locations.len());
 
         for (i, addr) in config.public.tcp_locations.iter().enumerate() {
             let (sx, rx) = unbounded_channel();
+            log::debug!(
+                "client creates a worker that will send messages to {}",
+                i + 1
+            );
             if i + 1 != config.public.self_rank.into() {
                 handles.push(tokio::spawn(sending_loop(
                     rx,
@@ -163,6 +175,7 @@ impl Client {
             broadcast_senders.insert((i + 1) as u8, sx);
         }
 
+        log::debug!("client created");
         Client { broadcast_senders }
     }
 
@@ -186,6 +199,7 @@ impl RegisterClient for Client {
 
     /// Broadcasts a system message to all processes in the system, including self.
     async fn broadcast(&self, msg: Broadcast) {
+        log::debug!("received an order to broadcast {:?}", msg.cmd);
         for sender in self.broadcast_senders.values() {
             sender
                 .send(SendType::Broadcast(Broadcast {
@@ -329,47 +343,52 @@ async fn serialize_client_response(
 }
 
 pub async fn create_system(config: Configuration) {
+    log::debug!("starting creating system");
+
     let self_ident = config.public.self_rank;
     let processes_count = config.public.tcp_locations.len() as u8;
-    // Architecture:
-    // Tcp handler receives and parses message and sends it to sx.
-    // This function (see loop below) creates workers. When sx receives something, adequate worker gets the message.
-    // Each worker has two channels: for client and system messages. A worker works only on one sector at a time.
-    // After finishing, workers send responses to TcpHandler.
+
     let (sx, mut rx) = unbounded_channel();
     TcpReceiver::run_receiver(&config, sx.clone()).await;
     let manager = build_sectors_manager(config.public.storage_dir.clone()).await;
     let client = Arc::new(Client::new(config, sx.clone()).await);
 
-    let mut worker_handles = Vec::with_capacity(WORKER_COUNT as usize);
     let mut worker_senders = Vec::with_capacity(WORKER_COUNT as usize);
 
+    log::debug!("creating workers");
     for _ in 0..WORKER_COUNT {
         let (wsx_client, wrx_client) = unbounded_channel();
         let (wsx_system, wrx_system) = unbounded_channel();
-        worker_handles.push(tokio::spawn(worker_loop(
+        tokio::spawn(worker_loop(
             client.clone(),
             manager.clone(),
             wrx_client,
             wrx_system,
             self_ident,
             processes_count,
-        )));
+        ));
         worker_senders.push((wsx_client, wsx_system))
     }
+    log::debug!("workers crated");
 
-    while let Some((mess, sender)) = rx.recv().await {
-        match mess {
-            RegisterCommand::Client(c) => {
-                let id = get_worker_id(c.header.sector_idx);
-                worker_senders[id].0.send((c, sender)).unwrap();
-            }
-            RegisterCommand::System(s) => {
-                let id = get_worker_id(s.header.sector_idx);
-                worker_senders[id].1.send(s).unwrap();
+    tokio::spawn(async move {
+        log::debug!("main loop starts");
+        while let Some((mess, sender)) = rx.recv().await {
+            match mess {
+                RegisterCommand::Client(c) => {
+                    let id = get_worker_id(c.header.sector_idx);
+                    log::debug!("got client message {:?}", c);
+                    worker_senders[id].0.send((c, sender)).unwrap();
+                }
+                RegisterCommand::System(s) => {
+                    let id = get_worker_id(s.header.sector_idx);
+                    // log::debug!("got system message {:?}", s);
+                    worker_senders[id].1.send(s).unwrap();
+                }
             }
         }
-    }
+        log::debug!("main loop ends");
+    });
 }
 
 fn get_worker_id(sector_idx: u64) -> usize {
@@ -408,44 +427,128 @@ async fn worker_loop(
     self_ident: u8,
     processes_count: u8,
 ) {
-    while let Some((client_message, response_sender)) = client_receiver.recv().await {
-        let curr_sector = client_message.header.sector_idx;
+    let mut is_processing_client_request = false;
+    let (this_sx, mut this_rx) = unbounded_channel();
+    let mut register: Option<Box<dyn AtomicRegister>> = None;
+    let mut sector = 0;
 
-        let mut register = build_atomic_register(
-            self_ident,
-            curr_sector,
-            client.clone(),
-            manager.clone(),
-            processes_count,
-        )
-        .await;
+    loop {
+        tokio::select! {
+            x = this_rx.recv() => {
+                is_processing_client_request = false;
+                register = None;
+                if x.is_none() {
+                    log::warn!("this_rx failed");
+                }
+            }
+            Some(system_message) = system_receiver.recv() => {
+                if register.is_some() && sector == system_message.header.sector_idx {
+                    register.as_mut().unwrap().system_command(system_message).await;
+                } else {
+                    handle_system_mess_without_register(self_ident, client.clone(), manager.clone(), system_message).await;
+                }
+            }
+            Some((client_message, response_sender)) = client_receiver.recv(), if !is_processing_client_request => {
+                is_processing_client_request = true;
+                sector = client_message.header.sector_idx;
+                let curr_sector = sector;
 
-        let rs = response_sender.clone();
-        let client2 = client.clone();
+                register = Some(build_atomic_register(
+                    self_ident,
+                    curr_sector,
+                    client.clone(),
+                    manager.clone(),
+                    processes_count,
+                )
+                .await);
 
-        let callback: ClientCallback = Box::new(move |op_success| {
-            Box::pin(async move {
-                let response = ClientResponse {
-                    response: if let OperationReturn::Read(ReadReturn { read_data }) =
-                        op_success.op_return
-                    {
-                        Some(read_data)
-                    } else {
-                        None
-                    },
-                    status_code: StatusCode::Ok,
-                    sector_idx: curr_sector,
-                    request_number: op_success.request_identifier,
-                };
-                rs.send(response).unwrap();
-                client2.end_broadcast(curr_sector).await;
-            })
-        });
+                let rs = response_sender.clone();
+                let client2 = client.clone();
+                let t_sx = this_sx.clone();
 
-        register.client_command(client_message, callback).await;
+                let callback: ClientCallback = Box::new(move |op_success| {
+                    Box::pin(async move {
+                        let response = ClientResponse {
+                            response: if let OperationReturn::Read(ReadReturn { read_data }) =
+                                op_success.op_return
+                            {
+                                Some(read_data)
+                            } else {
+                                None
+                            },
+                            status_code: StatusCode::Ok,
+                            sector_idx: curr_sector,
+                            request_number: op_success.request_identifier,
+                        };
+                        rs.send(response).unwrap();
+                        client2.end_broadcast(curr_sector).await;
+                        t_sx.send(()).unwrap();
+                    })
+                });
 
-        while let Some(system_message) = system_receiver.recv().await {
-            register.system_command(system_message).await;
+                register.as_mut().unwrap().client_command(client_message, callback).await;
+            }
         }
+    }
+}
+
+async fn handle_system_mess_without_register(
+    self_ident: u8,
+    client: Arc<dyn RegisterClient>,
+    manager: Arc<dyn SectorsManager>,
+    system_message: SystemRegisterCommand,
+) {
+    let sector_idx = system_message.header.sector_idx;
+    match system_message.content {
+        SystemRegisterCommandContent::ReadProc => {
+            let sector = manager.read_data(sector_idx).await;
+            let (ts, wr) = manager.read_metadata(sector_idx).await;
+            client
+                .send(Send {
+                    cmd: Arc::new(SystemRegisterCommand {
+                        header: SystemCommandHeader {
+                            process_identifier: self_ident,
+                            msg_ident: system_message.header.msg_ident,
+                            sector_idx,
+                        },
+                        content: SystemRegisterCommandContent::Value {
+                            timestamp: ts,
+                            write_rank: wr,
+                            sector_data: sector,
+                        },
+                    }),
+                    target: system_message.header.process_identifier,
+                })
+                .await;
+        }
+        SystemRegisterCommandContent::WriteProc {
+            timestamp,
+            write_rank,
+            data_to_write,
+        } => {
+            let (ts, wr) = manager
+                .read_metadata(system_message.header.sector_idx)
+                .await;
+            if (timestamp, write_rank) > (ts, wr) {
+                manager
+                    .write(sector_idx, &(data_to_write, timestamp, write_rank))
+                    .await;
+            }
+            client
+                .send(Send {
+                    cmd: Arc::new(SystemRegisterCommand {
+                        header: SystemCommandHeader {
+                            process_identifier: self_ident,
+                            msg_ident: system_message.header.msg_ident,
+                            sector_idx,
+                        },
+                        content: SystemRegisterCommandContent::Ack,
+                    }),
+                    target: system_message.header.process_identifier,
+                })
+                .await;
+        }
+        // Ignore other messages
+        _ => (),
     }
 }

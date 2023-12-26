@@ -47,9 +47,10 @@ impl Register {
         processes_count: u8,
     ) -> Register {
         log::debug!(
-            "creating a new register, self ident: {}, sector_idx: {}",
+            "creating a new register, self ident: {}, sector_idx: {}, processes_count: {}",
             self_ident,
-            sector_idx
+            sector_idx,
+            processes_count,
         );
         let (timestamp, write_rank) = sectors_manager.read_metadata(sector_idx).await;
         let val = sectors_manager.read_data(sector_idx).await;
@@ -79,7 +80,9 @@ impl Register {
     }
 
     async fn send(&self, cmd: SystemRegisterCommand, target: u8) {
-        log::debug!("{} sends {:?} to {}", self.self_ident, cmd, target);
+        if self.self_ident != target {
+            log::debug!("{} sends {:?} to {}", self.self_ident, cmd, target);
+        }
         self.client
             .send(crate::Send {
                 cmd: Arc::new(cmd),
@@ -286,6 +289,11 @@ impl Register {
                     op_return: OperationReturn::Write,
                 })
                 .await;
+                log::debug!(
+                    "{} finished callback, sector: {}",
+                    self.self_ident,
+                    self.sector_idx
+                );
             }
         }
     }
@@ -339,7 +347,9 @@ impl AtomicRegister for Register {
             return;
         }
 
-        log::debug!("{} received a system command: {:?}", self.self_ident, cmd);
+        if self.self_ident != cmd.header.process_identifier {
+            log::debug!("{} received a system command: {:?}", self.self_ident, cmd);
+        }
 
         match cmd.content {
             SystemRegisterCommandContent::ReadProc => self.read_proc(cmd.header).await,

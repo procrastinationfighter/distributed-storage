@@ -190,7 +190,7 @@ impl SectorsManager for Manager {
         match lock.get(&idx) {
             Some(&y) => y,
             None => {
-                log::warn!("metadata for sector {} not found", idx);
+                log::debug!("metadata for sector {} not found", idx);
                 (0, 0)
             }
         }
@@ -198,6 +198,7 @@ impl SectorsManager for Manager {
 
     /// Writes a new data, along with timestamp and write rank to some sector.
     async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8)) {
+        log::debug!("manager writes {:?}", sector);
         let old_filename = self.get_filename(idx).await;
         let temp_filename = self.metadata_to_filename(idx, sector.1, sector.2, true);
 
@@ -221,6 +222,7 @@ impl SectorsManager for Manager {
         }
 
         // Rename new file from .tmp to normal name.
+        log::debug!("renaming from {:?} to normal name", temp_filename);
         rename(
             temp_filename,
             self.metadata_to_filename(idx, sector.1, sector.2, false),
@@ -229,6 +231,7 @@ impl SectorsManager for Manager {
         .unwrap();
         self.sync_dir().await;
 
+        log::debug!("saving metadata for {:?}", sector);
         self.metadata
             .write()
             .await

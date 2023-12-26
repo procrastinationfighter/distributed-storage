@@ -38,8 +38,19 @@ pub struct PublicConfiguration {
     pub n_sectors: u64,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SectorVec(pub Vec<u8>);
+
+impl std::fmt::Debug for SectorVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let field = if self.0.len() > 1 {
+            format!("[{} ... {}", self.0[0], self.0.last().unwrap())
+        } else {
+            format!("{:?}", self.0)
+        };
+        f.debug_tuple("SectorVec").field(&field).finish()
+    }
+}
 
 pub type SectorIdx = u64;
 
