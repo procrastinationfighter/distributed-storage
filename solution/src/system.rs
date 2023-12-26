@@ -5,12 +5,10 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::*;
 
@@ -36,14 +34,13 @@ pub struct Client {
 async fn sending_loop(
     mut receiver: UnboundedReceiver<SendType>,
     broadcast_interval: u64,
-    addr: SocketAddr,
+    addr: (String, u16),
     hmac_key: [u8; 64],
 ) {
-    // TODO: don't fail when connection is severed: try to regain it instead
     let mut timer = interval(Duration::from_millis(broadcast_interval));
     let mut retry_conn_timer = interval(Duration::from_millis(broadcast_interval / 2));
     let mut broadcast_messages: HashMap<u64, RegisterCommand> = HashMap::new();
-    let mut stream = try_gaining_connection_with_peer(addr).await;
+    let mut stream = try_gaining_connection_with_peer(addr.clone()).await;
     // First tick finishes instantly
     timer.tick().await;
     retry_conn_timer.tick().await;
@@ -62,7 +59,7 @@ async fn sending_loop(
                 };
             }
             _ = retry_conn_timer.tick(), if stream.is_none() => {
-                stream = try_gaining_connection_with_peer(addr).await;
+                stream = try_gaining_connection_with_peer(addr.clone()).await;
             }
             m = receiver.recv(), if stream.is_some() => {
                 match m {
@@ -91,8 +88,8 @@ async fn sending_loop(
     }
 }
 
-async fn try_gaining_connection_with_peer(addr: SocketAddr) -> Option<TcpStream> {
-    TcpSocket::new_v4().unwrap().connect(addr).await.ok()
+async fn try_gaining_connection_with_peer(addr: (String, u16)) -> Option<TcpStream> {
+    TcpStream::connect(addr).await.ok()
 }
 
 async fn self_sending_loop(
@@ -147,15 +144,13 @@ impl Client {
         let mut broadcast_senders = HashMap::with_capacity(config.public.tcp_locations.len());
         let mut handles = Vec::with_capacity(config.public.tcp_locations.len());
 
-        for (i, (s, port)) in config.public.tcp_locations.iter().enumerate() {
+        for (i, addr) in config.public.tcp_locations.iter().enumerate() {
             let (sx, rx) = unbounded_channel();
             if i + 1 != config.public.self_rank.into() {
-                let addr = SocketAddr::new(IpAddr::from_str(s).unwrap(), *port);
-
                 handles.push(tokio::spawn(sending_loop(
                     rx,
                     500,
-                    addr,
+                    addr.clone(),
                     config.hmac_system_key,
                 )));
             } else {
@@ -214,8 +209,7 @@ impl TcpReceiver {
         config: &Configuration,
         sender: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
     ) {
-        let (s, port) = &config.public.tcp_locations[(config.public.self_rank - 1) as usize];
-        let addr = SocketAddr::new(IpAddr::from_str(s).unwrap(), *port);
+        let addr = &config.public.tcp_locations[(config.public.self_rank - 1) as usize];
 
         let rcvr = TcpReceiver {
             sender,
@@ -224,17 +218,12 @@ impl TcpReceiver {
             sector_count: config.public.n_sectors,
         };
 
-        tokio::spawn(client_receiver_loop(rcvr, addr));
+        tokio::spawn(client_receiver_loop(rcvr, addr.clone()));
     }
 }
 
-async fn client_receiver_loop(tcp_receiver: TcpReceiver, addr: SocketAddr) {
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.bind(addr).unwrap();
-
-    let listener = socket
-        .listen((CLIENT_CONNECTION_LIMIT + NODES_LIMIT) as u32)
-        .unwrap();
+async fn client_receiver_loop(tcp_receiver: TcpReceiver, addr: (String, u16)) {
+    let listener = TcpListener::bind(addr).await.unwrap();
 
     while let Ok((stream, _)) = listener.accept().await {
         let (rs, ws) = stream.into_split();
