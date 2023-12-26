@@ -8,7 +8,9 @@ pub static MAGIC_NUMBER: [u8; 4] = [0x61, 0x74, 0x64, 0x64];
 pub const MAGIC_NUMBER_LEN: usize = 4;
 pub const FILE_DESCRIPTOR_LIMIT: usize = 1024;
 pub const CLIENT_CONNECTION_LIMIT: usize = 16;
+pub const NODES_LIMIT: usize = 256;
 pub const SECTOR_SIZE: usize = 4096;
+pub const HMAC_TAG_SIZE: usize = 32;
 
 pub type ClientCallback =
     Box<dyn FnOnce(OperationSuccess) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;

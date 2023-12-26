@@ -8,7 +8,6 @@ use uuid::Uuid;
 use crate::domain::*;
 
 const WRITE_CONTENT_SIZE: usize = 4096;
-const HMAC_TAG_SIZE: usize = 32;
 const HEADER_SIZE: usize = 8;
 const CLIENT_REQUEST_NO_SIZE: usize = 8;
 const SECTOR_ID_SIZE: usize = 8;
@@ -28,7 +27,7 @@ const SYSTEM_MESSAGE_WITH_CONTENT_SIZE: usize = SYSTEM_BASIC_MESSAGE_SIZE + SYST
 // Create a type alias:
 type HmacSha256 = Hmac<Sha256>;
 
-fn calculate_hmac_tag(message: &mut Vec<u8>, size: usize, secret_key: &[u8]) {
+pub fn calculate_hmac_tag(message: &mut Vec<u8>, size: usize, secret_key: &[u8]) {
     // Initialize a new MAC instance from the secret key:
     let mut mac = HmacSha256::new_from_slice(secret_key).unwrap();
 
@@ -315,6 +314,7 @@ pub async fn serialize_register_command(
         RegisterCommand::System(s) => serialize_system_command(s, hmac_key).await,
     }?;
 
+    // TODO: change to write_all_buf
     let mut written = 0;
     while written < buf.len() {
         written += writer.write(&buf[written..]).await.unwrap();
