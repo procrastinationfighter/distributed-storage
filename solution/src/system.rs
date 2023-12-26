@@ -1,24 +1,18 @@
-use crate::atomic_register::Register;
 use crate::transfer::calculate_hmac_tag;
 use crate::{
     build_atomic_register, build_sectors_manager, deserialize_register_command, domain::*,
-    register_client_public::*, serialize_register_command, AtomicRegister, SectorsManager,
+    register_client_public::*, serialize_register_command, SectorsManager,
 };
-use core::time;
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::ops::DerefMut;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
-use tokio::runtime::Handle;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpSocket;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{broadcast, Mutex};
-use tokio::task::JoinHandle;
 use tokio::time::*;
-use uuid::Uuid;
 
 // Number of workers that handle atomic registers.
 const WORKER_COUNT: u64 = 500;
@@ -36,13 +30,7 @@ enum SendType {
 }
 
 pub struct Client {
-    self_rank: u8,
-    self_channel: UnboundedSender<(RegisterCommand, SocketAddr)>,
-    broadcast_task_handles: Vec<JoinHandle<()>>,
     broadcast_senders: HashMap<u8, UnboundedSender<SendType>>,
-
-    client_key: [u8; 32],
-    system_key: [u8; 64],
 }
 
 async fn sending_loop(
@@ -51,6 +39,7 @@ async fn sending_loop(
     addr: SocketAddr,
     hmac_key: [u8; 64],
 ) {
+    // TODO: don't fail when connection is severed: try to regain it instead
     let mut timer = interval(Duration::from_millis(broadcast_interval));
     let mut broadcast_messages: HashMap<u64, RegisterCommand> = HashMap::new();
     let mut stream = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
@@ -92,12 +81,11 @@ async fn sending_loop(
 async fn self_sending_loop(
     mut receiver: UnboundedReceiver<SendType>,
     broadcast_interval: u64,
-    self_channel: UnboundedSender<(RegisterCommand, SocketAddr)>,
-    hmac_key: [u8; 64],
+    self_channel: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
 ) {
     let mut timer = interval(Duration::from_millis(broadcast_interval));
     let mut broadcast_messages: HashMap<u64, RegisterCommand> = HashMap::new();
-    let dummy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+    let (dummy_sender, _) = unbounded_channel();
 
     // First tick finishes instantly
     timer.tick().await;
@@ -106,7 +94,7 @@ async fn self_sending_loop(
         tokio::select! {
             _ = timer.tick() => {
                 for m in broadcast_messages.values() {
-                    self_channel.send((m.clone(), dummy_addr.clone())).unwrap();
+                    self_channel.send((m.clone(), dummy_sender.clone())).unwrap();
                 }
             }
             m = receiver.recv() => {
@@ -116,12 +104,12 @@ async fn self_sending_loop(
                             let cmd = RegisterCommand::System((*b.cmd).clone());
 
                             // Send first broadcast instantly and next one when timer ticks.
-                            self_channel.send((cmd.clone(), dummy_addr.clone())).unwrap();
+                            self_channel.send((cmd.clone(), dummy_sender.clone())).unwrap();
                             broadcast_messages.insert(b.cmd.header.sector_idx, cmd);
                         },
                         SendType::Send(s) => {
                             let cmd = RegisterCommand::System((*s.cmd).clone());
-                            self_channel.send((cmd.clone(), dummy_addr.clone())).unwrap();
+                            self_channel.send((cmd.clone(), dummy_sender.clone())).unwrap();
                         },
                         SendType::FinishBroadcast(target) => {
                             broadcast_messages.remove(&target);
@@ -135,46 +123,35 @@ async fn self_sending_loop(
 }
 
 impl Client {
-    pub async fn new(
+    async fn new(
         config: Configuration,
-        self_channel: UnboundedSender<(RegisterCommand, SocketAddr)>,
+        self_channel: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
     ) -> Client {
         let mut broadcast_senders = HashMap::with_capacity(config.public.tcp_locations.len());
         let mut handles = Vec::with_capacity(config.public.tcp_locations.len());
 
         for (i, (s, port)) in config.public.tcp_locations.iter().enumerate() {
             let (sx, rx) = unbounded_channel();
-            if i + 1 == config.public.self_rank.into() {
+            if i + 1 != config.public.self_rank.into() {
                 let addr = SocketAddr::new(IpAddr::from_str(s).unwrap(), *port);
 
                 handles.push(tokio::spawn(sending_loop(
                     rx,
                     500,
                     addr,
-                    config.hmac_system_key.clone(),
+                    config.hmac_system_key,
                 )));
             } else {
-                let addr = SocketAddr::new(IpAddr::from_str(s).unwrap(), *port);
-
                 handles.push(tokio::spawn(self_sending_loop(
                     rx,
                     500,
                     self_channel.clone(),
-                    config.hmac_system_key.clone(),
                 )));
             }
             broadcast_senders.insert((i + 1) as u8, sx);
         }
 
-        Client {
-            self_rank: config.public.self_rank,
-            self_channel,
-            broadcast_task_handles: handles,
-            broadcast_senders,
-
-            client_key: config.hmac_client_key,
-            system_key: config.hmac_system_key,
-        }
+        Client { broadcast_senders }
     }
 
     async fn end_broadcast(&self, sector_idx: u64) {
@@ -207,78 +184,107 @@ impl RegisterClient for Client {
     }
 }
 
-// Receives messages over tcp and responds to clients
-struct TcpHandler {
-    receiver_handle: JoinHandle<()>,
-    sender_handle: JoinHandle<()>,
-}
-
+#[derive(Clone)]
 struct TcpReceiver {
-    sender: UnboundedSender<(RegisterCommand, SocketAddr)>,
-    error_sender: UnboundedSender<(ClientResponse, SocketAddr)>,
-    clients: Arc<Mutex<HashMap<Uuid, String>>>,
+    sender: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
     client_key: [u8; 32],
     system_key: [u8; 64],
     sector_count: u64,
 }
 
-struct TcpSender {
-    receiver: UnboundedReceiver<(ClientResponse, SocketAddr)>,
-    clients: Arc<Mutex<HashMap<Uuid, String>>>,
-    socket: TcpSocket,
+impl TcpReceiver {
+    async fn run_receiver(
+        config: &Configuration,
+        sender: UnboundedSender<(RegisterCommand, UnboundedSender<ClientResponse>)>,
+    ) {
+        let (s, port) = &config.public.tcp_locations[(config.public.self_rank - 1) as usize];
+        let addr = SocketAddr::new(IpAddr::from_str(s).unwrap(), *port);
+
+        let rcvr = TcpReceiver {
+            sender,
+            client_key: config.hmac_client_key,
+            system_key: config.hmac_system_key,
+            sector_count: config.public.n_sectors,
+        };
+
+        tokio::spawn(client_receiver_loop(rcvr, addr));
+    }
 }
 
-async fn client_receiver_loop(mut tcp_receiver: TcpReceiver, addr: SocketAddr) {
+async fn client_receiver_loop(tcp_receiver: TcpReceiver, addr: SocketAddr) {
     let socket = TcpSocket::new_v4().unwrap();
-    let dummy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
     socket.bind(addr).unwrap();
 
     let listener = socket
         .listen((CLIENT_CONNECTION_LIMIT + NODES_LIMIT) as u32)
         .unwrap();
 
-    while let Ok((mut stream, addr)) = listener.accept().await {
-        // TODO: rewrite so that it does not read only one connection
-        while let Ok((cmd, hmac_ok)) = deserialize_register_command(
-            &mut stream,
-            &tcp_receiver.system_key,
-            &tcp_receiver.client_key,
-        )
-        .await
-        {
+    while let Ok((stream, _)) = listener.accept().await {
+        let (rs, ws) = stream.into_split();
+        let (sender_sx, sender_rx) = unbounded_channel();
+
+        tokio::spawn(one_client_receiver_loop(
+            rs,
+            tcp_receiver.clone(),
+            sender_sx,
+        ));
+        tokio::spawn(client_sender_loop(ws, tcp_receiver.client_key, sender_rx));
+    }
+}
+
+async fn one_client_receiver_loop(
+    mut rs: OwnedReadHalf,
+    tcp_receiver: TcpReceiver,
+    sender_sx: UnboundedSender<ClientResponse>,
+) {
+    while let Ok((cmd, hmac_ok)) =
+        deserialize_register_command(&mut rs, &tcp_receiver.system_key, &tcp_receiver.client_key)
+            .await
+    {
+        if let RegisterCommand::Client(c) = cmd {
+            let mut response = ClientResponse {
+                response: None,
+                status_code: StatusCode::Ok,
+                sector_idx: c.header.sector_idx,
+                request_number: c.header.request_identifier,
+            };
             if !hmac_ok {
-                tcp_receiver
-                    .error_sender
-                    .send((ClientResponse::InvalicHmac, addr))
-                    .unwrap();
-            } else if let RegisterCommand::Client(c) = cmd {
-                if c.header.sector_idx >= tcp_receiver.sector_count {
-                    tcp_receiver
-                        .error_sender
-                        .send((ClientResponse::WrongSector, addr))
-                        .unwrap();
-                } else {
-                    tcp_receiver
-                        .sender
-                        .send((RegisterCommand::Client(c), addr))
-                        .unwrap();
-                }
-            } else {
-                tcp_receiver.sender.send((cmd, dummy_addr)).unwrap();
+                response.status_code = StatusCode::AuthFailure;
+                sender_sx.send(response).unwrap();
+                continue;
+            } else if response.sector_idx >= tcp_receiver.sector_count {
+                response.status_code = StatusCode::InvalidSectorIndex;
+                sender_sx.send(response).unwrap();
+                continue;
             }
+            tcp_receiver
+                .sender
+                .send((RegisterCommand::Client(c), sender_sx.clone()))
+                .unwrap();
+        } else if !hmac_ok {
+            log::warn!("hmac could not be confirmed for a message");
+        } else {
+            tcp_receiver.sender.send((cmd, sender_sx.clone())).unwrap();
         }
     }
 }
 
-async fn client_sender_loop(tcp_sender: TcpSender) {
-    // TODO this should actually be a "connection" loop
-    while let Some((mess, addr)) = tcp_sender.receiver.recv().await {
-        serialize_client_response(mess, writer, &tcp_sender.client_key).await;
+async fn client_sender_loop(
+    mut ws: OwnedWriteHalf,
+    client_key: [u8; 32],
+    mut receiver: UnboundedReceiver<ClientResponse>,
+) {
+    while let Some(response) = receiver.recv().await {
+        let buf = serialize_client_response(response, &mut ws, &client_key).await;
+
+        if let Err(e) = buf {
+            log::debug!("connection issue: {}", e.to_string());
+        }
     }
 }
 
 async fn serialize_client_response(
-    mut res: ClientResponse,
+    res: ClientResponse,
     writer: &mut (dyn AsyncWrite + std::marker::Send + Unpin),
     hmac_key: &[u8],
 ) -> io::Result<()> {
@@ -305,53 +311,15 @@ async fn serialize_client_response(
         buf.append(&mut res.response.unwrap().0);
     }
 
-    calculate_hmac_tag(&mut buf, buf.len(), hmac_key);
+    let size = buf.len();
+    calculate_hmac_tag(&mut buf, size, hmac_key);
 
-    writer.write_all_buf(&mut buf)?;
+    let mut written = 0;
+    while written < buf.len() {
+        written += writer.write(&buf[written..]).await.unwrap();
+    }
 
     Ok(())
-}
-
-impl TcpHandler {
-    async fn new(
-        config: &Configuration,
-        sender: UnboundedSender<(RegisterCommand, SocketAddr)>,
-        receiver: UnboundedReceiver<(ClientResponse, SocketAddr)>,
-        error_sender: UnboundedSender<(ClientResponse, SocketAddr)>,
-    ) -> TcpHandler {
-        let (s, port) = &config.public.tcp_locations[(config.public.self_rank - 1) as usize];
-        let addr = SocketAddr::new(IpAddr::from_str(&s).unwrap(), *port);
-        let clients = Arc::new(Mutex::new(HashMap::new()));
-
-        // TODO: this architecture is wrong
-        // correct approach: create a loop for every connection
-        // if connection is severed, connect again when sending response
-        let rcvr = TcpReceiver {
-            sender,
-            error_sender,
-            clients: clients.clone(),
-            client_key: config.hmac_client_key,
-            system_key: config.hmac_system_key,
-            sector_count: config.public.n_sectors,
-        };
-
-        let socket = TcpSocket::new_v4().unwrap();
-        socket.bind(addr).unwrap();
-
-        let sndr = TcpSender {
-            receiver,
-            clients,
-            socket,
-        };
-
-        let rh = tokio::spawn(client_receiver_loop(rcvr, addr));
-        let sh = tokio::spawn(client_sender_loop(sndr));
-
-        TcpHandler {
-            receiver_handle: rh,
-            sender_handle: sh,
-        }
-    }
 }
 
 pub async fn create_system(config: Configuration) {
@@ -363,15 +331,14 @@ pub async fn create_system(config: Configuration) {
     // Each worker has two channels: for client and system messages. A worker works only on one sector at a time.
     // After finishing, workers send responses to TcpHandler.
     let (sx, mut rx) = unbounded_channel();
-    let (c_sx, c_rx) = unbounded_channel();
-    let tcp_handler = TcpHandler::new(&config, sx.clone(), c_rx, c_sx.clone()).await;
+    TcpReceiver::run_receiver(&config, sx.clone()).await;
     let manager = build_sectors_manager(config.public.storage_dir.clone()).await;
     let client = Arc::new(Client::new(config, sx.clone()).await);
 
     let mut worker_handles = Vec::with_capacity(WORKER_COUNT as usize);
     let mut worker_senders = Vec::with_capacity(WORKER_COUNT as usize);
 
-    for i in 0..WORKER_COUNT {
+    for _ in 0..WORKER_COUNT {
         let (wsx_client, wrx_client) = unbounded_channel();
         let (wsx_system, wrx_system) = unbounded_channel();
         worker_handles.push(tokio::spawn(worker_loop(
@@ -381,16 +348,15 @@ pub async fn create_system(config: Configuration) {
             wrx_system,
             self_ident,
             processes_count,
-            c_sx.clone(),
         )));
         worker_senders.push((wsx_client, wsx_system))
     }
 
-    while let Some((mess, addr)) = rx.recv().await {
+    while let Some((mess, sender)) = rx.recv().await {
         match mess {
             RegisterCommand::Client(c) => {
                 let id = get_worker_id(c.header.sector_idx);
-                worker_senders[id].0.send((c, addr)).unwrap();
+                worker_senders[id].0.send((c, sender)).unwrap();
             }
             RegisterCommand::System(s) => {
                 let id = get_worker_id(s.header.sector_idx);
@@ -428,13 +394,15 @@ impl ClientResponse {
 async fn worker_loop(
     client: Arc<Client>,
     manager: Arc<dyn SectorsManager>,
-    mut client_receiver: UnboundedReceiver<(ClientRegisterCommand, SocketAddr)>,
+    mut client_receiver: UnboundedReceiver<(
+        ClientRegisterCommand,
+        UnboundedSender<ClientResponse>,
+    )>,
     mut system_receiver: UnboundedReceiver<SystemRegisterCommand>,
     self_ident: u8,
     processes_count: u8,
-    mut respond_sender: UnboundedSender<(ClientResponse, SocketAddr)>,
 ) {
-    while let Some((client_message, addr)) = client_receiver.recv().await {
+    while let Some((client_message, response_sender)) = client_receiver.recv().await {
         let curr_sector = client_message.header.sector_idx;
 
         let mut register = build_atomic_register(
@@ -446,32 +414,32 @@ async fn worker_loop(
         )
         .await;
 
-        let mut rs = respond_sender.clone();
-        let mut a2 = addr.clone();
-        let (this_sx, mut this_rx) = unbounded_channel();
+        let rs = response_sender.clone();
+        let client2 = client.clone();
 
         let callback: ClientCallback = Box::new(move |op_success| {
             Box::pin(async move {
-                rs.send((ClientResponse::Success(op_success), a2)).unwrap();
-                this_sx.send(()).unwrap();
+                let response = ClientResponse {
+                    response: if let OperationReturn::Read(ReadReturn { read_data }) =
+                        op_success.op_return
+                    {
+                        Some(read_data)
+                    } else {
+                        None
+                    },
+                    status_code: StatusCode::Ok,
+                    sector_idx: curr_sector,
+                    request_number: op_success.request_identifier,
+                };
+                rs.send(response).unwrap();
+                client2.end_broadcast(curr_sector).await;
             })
         });
 
         register.client_command(client_message, callback).await;
 
-        loop {
-            tokio::select! {
-                Some(system_message) = system_receiver.recv() => {
-                    register.system_command(system_message).await;
-                }
-                Some(()) = this_rx.recv() => {
-                    client.end_broadcast(curr_sector).await;
-                    break;
-                }
-            }
-        }
         while let Some(system_message) = system_receiver.recv().await {
-            register.system_command(system_message);
+            register.system_command(system_message).await;
         }
     }
 }

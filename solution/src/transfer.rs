@@ -314,7 +314,6 @@ pub async fn serialize_register_command(
         RegisterCommand::System(s) => serialize_system_command(s, hmac_key).await,
     }?;
 
-    // TODO: change to write_all_buf
     let mut written = 0;
     while written < buf.len() {
         written += writer.write(&buf[written..]).await.unwrap();
