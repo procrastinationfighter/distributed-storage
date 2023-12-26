@@ -10,7 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpSocket;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::*;
 
@@ -41,31 +41,44 @@ async fn sending_loop(
 ) {
     // TODO: don't fail when connection is severed: try to regain it instead
     let mut timer = interval(Duration::from_millis(broadcast_interval));
+    let mut retry_conn_timer = interval(Duration::from_millis(broadcast_interval / 2));
     let mut broadcast_messages: HashMap<u64, RegisterCommand> = HashMap::new();
-    let mut stream = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
+    let mut stream = try_gaining_connection_with_peer(addr).await;
     // First tick finishes instantly
     timer.tick().await;
+    retry_conn_timer.tick().await;
 
     loop {
         tokio::select! {
-            _ = timer.tick() => {
+            _ = timer.tick(), if stream.is_some() => {
+                let mut st = stream.unwrap();
+                let mut res = Ok(());
                 for m in broadcast_messages.values() {
-                    serialize_register_command(m, &mut stream, &hmac_key).await.unwrap();
+                    res = serialize_register_command(m, &mut st, &hmac_key).await;
                 }
+                stream = match res {
+                    Ok(_) => Some(st),
+                    Err(_) => None,
+                };
             }
-            m = receiver.recv() => {
+            _ = retry_conn_timer.tick(), if stream.is_none() => {
+                stream = try_gaining_connection_with_peer(addr).await;
+            }
+            m = receiver.recv(), if stream.is_some() => {
                 match m {
                     Some(mess) => match mess {
                         SendType::Broadcast(b) => {
                             let cmd = RegisterCommand::System((*b.cmd).clone());
-
-                            // Send first broadcast instantly and next one when timer ticks.
-                            serialize_register_command(&cmd, &mut stream, &hmac_key).await.unwrap();
                             broadcast_messages.insert(b.cmd.header.sector_idx, cmd);
                         },
                         SendType::Send(s) => {
                             let cmd = RegisterCommand::System((*s.cmd).clone());
-                            serialize_register_command(&cmd, &mut stream, &hmac_key).await.unwrap();
+                            let mut st = stream.unwrap();
+                            let res = serialize_register_command(&cmd, &mut st, &hmac_key).await;
+                            stream = match res {
+                                Ok(_) => Some(st),
+                                Err(_) => None,
+                            };
                         },
                         SendType::FinishBroadcast(target) => {
                             broadcast_messages.remove(&target);
@@ -76,6 +89,10 @@ async fn sending_loop(
             }
         }
     }
+}
+
+async fn try_gaining_connection_with_peer(addr: SocketAddr) -> Option<TcpStream> {
+    TcpSocket::new_v4().unwrap().connect(addr).await.ok()
 }
 
 async fn self_sending_loop(
